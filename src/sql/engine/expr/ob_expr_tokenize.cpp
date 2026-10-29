@@ -601,11 +601,29 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
   return ret;
 }
 
+// The loader path below is only meaningful while the dictionary is changing.  Cache the
+// last verified (epoch, collation) per thread: as long as the dictionary has not been
+// rebuilt since, the loader lookup and in-transaction load cannot change the outcome.
+struct ObTokenizeDicGate
+{
+  uint64_t epoch_;
+  ObCollationType collation_;
+  bool valid_;
+  ObTokenizeDicGate() : epoch_(0), collation_(CS_TYPE_INVALID), valid_(false) {}
+};
+
 int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
 {
   int ret = OB_SUCCESS;
   bool need_to_load_dic = false;
   storage::ObDicLoaderHandle dic_loader_handle;
+  static thread_local ObTokenizeDicGate dic_gate;
+  const uint64_t dic_epoch = storage::ob_fts_dict_epoch();
+  if (dic_gate.valid_ && dic_gate.epoch_ == dic_epoch
+      && dic_gate.collation_ == meta_.get_collation_type()) {
+    // dictionary unchanged since the last successful check on this thread
+    return OB_SUCCESS;
+  }
   if (OB_FAIL(share::ObFtsIndexBuilderUtil::check_need_to_load_dic(
           parser_name_, need_to_load_dic))) {
   } else if (need_to_load_dic) {
@@ -617,6 +635,11 @@ int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
     }
+  }
+  if (OB_SUCC(ret)) {
+    dic_gate.epoch_ = dic_epoch;
+    dic_gate.collation_ = meta_.get_collation_type();
+    dic_gate.valid_ = true;
   }
   return ret;
 }

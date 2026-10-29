@@ -287,14 +287,18 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
   static constexpr int64_t FT_MAX_WORD_BUCKET = 997;
   const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 10, 2), FT_MAX_WORD_BUCKET);
   int64_t doc_length = 0;
-  ObFTWordMap ft_word_map;
+  // 批量建索引时本函数按行调用：每行 create/destroy 一张哈希表意味着桶数组
+  // 反复分配和清零。改为线程内复用同一张表（reuse 只清零，不重新分配）。
+  thread_local ObFTWordMap ft_word_map;
   void *rows_buf = nullptr;
   blocksstable::ObDatumRow *rows = nullptr;
   if (OB_ISNULL(helper) || OB_UNLIKELY(!ft_obj_meta.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (0 == fulltext.length()) {
     ret = OB_ITER_END;
-  } else if (OB_FAIL(ft_word_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+  } else if (OB_FAIL(ft_word_map.created()
+                       ? ft_word_map.reuse()
+                       : ft_word_map.create(MAX(ft_word_bkt_cnt, 251), common::ObMemAttr("FTWordMap")))) {
   } else if (OB_FAIL(segment_and_calc_word_count(allocator,
                                                  helper,
                                                  ft_obj_meta,
@@ -309,6 +313,10 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
   } else {
     int64_t i = 0;
     rows = new (rows_buf) blocksstable::ObDatumRow[ft_word_map.size()];
+    if (OB_FAIL(word_rows.reserve(ft_word_map.size()))) {
+      LOG_WARN("reserve word rows failed", K(ret), K(ft_word_map.size()));
+      ret = OB_SUCCESS;
+    }
     for (ObFTWordMap::const_iterator iter = ft_word_map.begin();
          OB_SUCC(ret) && iter != ft_word_map.end();
          ++iter) {
