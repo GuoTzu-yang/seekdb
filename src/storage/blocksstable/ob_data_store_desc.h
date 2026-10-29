@@ -90,7 +90,7 @@ private:
   OB_INLINE void init_block_size(const share::schema::ObMergeSchema &merge_schema);
   static const int64_t DEFAULT_RESERVE_PERCENT = 90;
   static const int64_t MIN_RESERVED_SIZE = 1024; //1KB;
-  static const int64_t MICRO_BLOCK_SIZE_LIMIT_FOR_SCAN = 8 * 1024; // 16KB
+  static const int64_t MICRO_BLOCK_SIZE_LIMIT_FOR_SCAN = 16 * 1024; // 16KB
   static const ObCompressorType DEFAULT_MINOR_COMPRESSOR_TYPE = ObCompressorType::ZSTD_1_3_8_COMPRESSOR;
   bool operator==(const ObStaticDataStoreDesc &other) const; // for unittest
 public:
