@@ -1332,30 +1332,26 @@ int ObDASTRTaatIter::inner_load_next_hashmap()
     ret = OB_INVALID_ARGUMENT;
   }
 
-  ObSEArray<ObExpr *, 2> exprs;
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(exprs.push_back(doc_id_expr))) {
-  } else if (need_relevance) {
-    if (OB_FAIL(exprs.push_back(relevance_expr))) {
-    }
-  }
-
-  sql::ObEvalCtx *ctx = ir_rtdef_->eval_ctx_;
-  ObEvalCtx::BatchInfoScopeGuard guard(*ctx);
-  guard.set_batch_idx(0);
+  // The store contains doc id followed by optional relevance. Aggregate its
+  // datums directly; output expressions are populated when emitting the map.
+  // ObDocIdExt owns a copy, so keys do not retain pointers into store blocks.
+  const uint32_t cell_count = need_relevance ? 2 : 1;
 
   ObDocIdExt doc_id;
   double cur_relevance = 0;
   double last_relevance = 0;
   while (OB_SUCC(ret)) {
-    if (OB_FAIL(store_iter->get_next_row(*ctx, exprs))) {
+    const sql::ObChunkDatumStore::StoredRow *row = nullptr;
+    if (OB_FAIL(store_iter->get_next_row(row))) {
       if (OB_UNLIKELY(OB_ITER_END != ret)) {
       }
+    } else if (OB_ISNULL(row) || OB_UNLIKELY(row->cnt_ != cell_count)) {
+      ret = OB_ERR_UNEXPECTED;
     } else {
-      ObDatum &doc_id_datum = doc_id_expr->locate_expr_datum(*ir_rtdef_->eval_ctx_);
+      const ObDatum &doc_id_datum = row->cells()[0];
       if (OB_FAIL(doc_id.from_datum(doc_id_datum))) {
       } else if (need_relevance) {
-        ObDatum &relevance_datum = relevance_expr->locate_expr_datum(*ir_rtdef_->eval_ctx_);
+        const ObDatum &relevance_datum = row->cells()[1];
         cur_relevance = relevance_datum.get_double();
         if (OB_FAIL(map->get_refactored(doc_id, last_relevance))) {
           if (OB_HASH_NOT_EXIST != ret) {

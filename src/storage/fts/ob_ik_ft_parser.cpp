@@ -16,7 +16,7 @@
 
 #define USING_LOG_PREFIX STORAGE_FTS
 
-#include "src/storage/fts/ob_ik_ft_parser.h"
+#include "storage/fts/ob_ik_ft_parser.h"
 
 #include "lib/charset/ob_charset.h"
 #include "lib/ob_errno.h"
@@ -265,12 +265,10 @@ int ObIKFTParser::process_one_char(TokenizeContext &ctx,
 {
   int ret = OB_SUCCESS;
   // proces by char with all segmenters
-  for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
-       OB_SUCC(ret) && iter != segmenters_.end();
-       iter++) {
+  for (int64_t i = 0; OB_SUCC(ret) && i < 4; ++i) {
     // process_next_batch already fetched this character. Processors append
     // tokens without advancing the context; only the outer loop steps it.
-    if (OB_FAIL((*iter)->do_process(ctx, ch, char_len, type))) {
+    if (OB_FAIL(segmenters_[i]->do_process(ctx, ch, char_len, type))) {
     }
   }
   return ret;
@@ -471,16 +469,13 @@ int ObIKFTParser::init_segmenter(const ObFTParserParam &param)
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_ISNULL(surrogate_seg = OB_NEWx(ObIKSurrogateProcessor, &allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(segmenters_.push_back(letter_seg))) {
-  } else if (FALSE_IT(letter_seg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(cnqsg))) {
-  } else if (FALSE_IT(cnqsg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(cjksg))) {
-  } else if (FALSE_IT(cjksg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(surrogate_seg))) {
-  } else if (OB_FALSE_IT(surrogate_seg = nullptr)) {
+  } else {
+    segmenters_[0] = letter_seg;
+    segmenters_[1] = cnqsg;
+    segmenters_[2] = cjksg;
+    segmenters_[3] = surrogate_seg;
   }
-  // push back by order, quantifier is before cjk
+  // Preserve processor order: quantifier must precede CJK.
 
   if (OB_FAIL(ret)) {
     OB_DELETEx(ObIKLetterProcessor, &allocator_, letter_seg);
@@ -498,13 +493,13 @@ void ObIKFTParser::reset()
     allocator_.free(ctx_);
   }
 
-  for (ObIIKProcessor *segmenter : segmenters_) {
+  for (ObIIKProcessor *&segmenter : segmenters_) {
     if (!OB_ISNULL(segmenter)) {
       segmenter->~ObIIKProcessor();
       allocator_.free(segmenter);
+      segmenter = nullptr;
     }
   }
-  segmenters_.clear();
 
   if (dict_borrowed_) {
     // owned by the shared bundle, only drop our references
