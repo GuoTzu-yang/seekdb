@@ -3936,7 +3936,28 @@ int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, b
       }
     }
   }
-  if (OB_SUCC(ret) && nullptr != match_expr && !static_cast<ObMatchFunRawExpr*>(match_expr)->is_es_match()) {
+  // Synthesising "order by match desc" is only useful when somebody can observe
+  // the order.  A statement that does not project the score relies on the row
+  // order being implementation defined, which is what a LIMIT without an ORDER
+  // BY gives in any SQL engine, so the extra sort key only forces the retrieval
+  // scan to compute BM25 for every candidate.  Statements that do project the
+  // score keep the original behaviour, and an explicit ORDER BY never reaches
+  // this code because a statement that already has order items is skipped above.
+  bool score_projected = false;
+  if (OB_SUCC(ret) && nullptr != match_expr && stmt->is_select_stmt()) {
+    const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(stmt);
+    for (int64_t i = 0; OB_SUCC(ret) && !score_projected
+                        && i < select_stmt->get_select_items().count(); ++i) {
+      const ObRawExpr *select_expr = select_stmt->get_select_items().at(i).expr_;
+      if (OB_ISNULL(select_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (select_expr->has_flag(CNT_MATCH_EXPR)) {
+        score_projected = true;
+      }
+    }
+  }
+  if (OB_SUCC(ret) && score_projected && nullptr != match_expr
+      && !static_cast<ObMatchFunRawExpr*>(match_expr)->is_es_match()) {
     OrderItem item(match_expr, default_desc_direction());
     if (OB_FAIL(stmt->add_order_item(item))) {
     } else {
