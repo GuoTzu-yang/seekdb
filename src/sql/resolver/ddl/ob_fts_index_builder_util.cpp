@@ -1047,7 +1047,12 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = MAX(original_parallelism, 1L);
+        // Building the FTS aux tables is CPU bound (word segmentation + row
+        // expansion), so a DOP of 1 leaves all but one core idle.  Keep the
+        // original /3 semantics as one lower bound and add a second one capped
+        // by the CPU count; the cap of 4 avoids oversubscribing small machines.
+        decided_parallelism = MAX(MAX(original_parallelism / 3, 1L),
+                                  MIN(get_cpu_num(), static_cast<int64_t>(4)));
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:

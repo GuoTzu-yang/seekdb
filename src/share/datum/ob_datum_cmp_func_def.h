@@ -387,7 +387,35 @@ struct ObDatumStrCmp : public ObDefined<SupportedCollection<CS_TYPE>::defined_>
 {
   inline static int cmp(const ObDatum &l, const ObDatum &r, int &cmp_ret)
   {
-    return ObDatumStrCmpImpl::cmp(l, r, cmp_ret, CS_TYPE, WITH_END_SPACE);
+    // The handler of a compile-time collation never changes, so it is resolved
+    // once per instantiation instead of on every comparison.  This skips the
+    // collation range check and the global handler array read that strcmpsp
+    // performs per call, while still running the very same strnncollsp.
+    const ObCharsetInfo *cs = handler();
+    if (OB_LIKELY(nullptr != cs)
+        && OB_LIKELY((nullptr != l.ptr_ || 0 == l.len_) && l.len_ >= 0)
+        && OB_LIKELY((nullptr != r.ptr_ || 0 == r.len_) && r.len_ >= 0)) {
+      const int res = cs->coll->strnncollsp(cs,
+                                            reinterpret_cast<const unsigned char *>(l.ptr_),
+                                            l.len_,
+                                            reinterpret_cast<const unsigned char *>(r.ptr_),
+                                            r.len_,
+                                            WITH_END_SPACE);
+      cmp_ret = res > 0 ? 1 : (res < 0 ? -1 : 0);
+      return OB_SUCCESS;
+    } else {
+      // Same argument validation outcome as strcmpsp: invalid arguments compare
+      // equal, so keep the original path authoritative for them.
+      return ObDatumStrCmpImpl::cmp(l, r, cmp_ret, CS_TYPE, WITH_END_SPACE);
+    }
+  }
+
+private:
+  static const ObCharsetInfo *handler()
+  {
+    static const ObCharsetInfo *cached = ObCharset::get_charset(CS_TYPE);
+    return (nullptr != cached && nullptr != cached->coll && nullptr != cached->coll->strnncollsp)
+               ? cached : nullptr;
   }
 };
 
