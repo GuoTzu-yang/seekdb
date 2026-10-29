@@ -57,6 +57,12 @@ private:
   // TODO: if memory lifetime of docid datum is guaranteed by dim_iters, we can use pointer to datum directly
   //       and avoid deep copy into merge heap here
   const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids_;
+  // Resolving the collation handler on every comparison costs a range check,
+  // a global array read and a null check per call.  Doc ids share one
+  // collation for the whole merge, so the handler is resolved once in init()
+  // and the very same strnncollsp is called directly afterwards.
+  const ObCharsetInfo *cs_;
+  bool cmp_end_space_;
   bool is_inited_;
 };
 

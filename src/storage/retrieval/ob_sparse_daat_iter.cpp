@@ -26,6 +26,8 @@ namespace storage
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
     iter_ids_(nullptr),
+    cs_(nullptr),
+    cmp_end_space_(true),
     is_inited_(false)
 {
 }
@@ -39,11 +41,20 @@ int ObSRMergeCmp::init(
     ret = OB_ERR_UNEXPECTED;
   } else {
     iter_ids_ = iter_ids;
+    // Trailing spaces are significant for variable-length doc ids and are
+    // padding for fixed-length ones, which mirrors the datum compare helpers.
+    cmp_end_space_ = (ObCharType != id_meta.type_);
     common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, id_meta.cs_type_);
     cmp_func_ = basic_funcs->null_first_cmp_;
     if (OB_ISNULL(cmp_func_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
+      if (ObVarcharType == id_meta.type_ || ObCharType == id_meta.type_) {
+        const ObCharsetInfo *cs = ObCharset::get_charset(id_meta.cs_type_);
+        if (OB_NOT_NULL(cs) && OB_NOT_NULL(cs->coll) && OB_NOT_NULL(cs->coll->strnncollsp)) {
+          cs_ = cs;
+        }
+      }
       is_inited_ = true;
     }
   }
@@ -60,8 +71,17 @@ int ObSRMergeCmp::cmp(
     ret = OB_NOT_INIT;
   } else {
     int tmp_ret = 0;
-    if (OB_FAIL(cmp_func_(
-            get_id_datum(l.iter_idx_), get_id_datum(r.iter_idx_), tmp_ret, nullptr))) {
+    const ObDatum &l_datum = get_id_datum(l.iter_idx_);
+    const ObDatum &r_datum = get_id_datum(r.iter_idx_);
+    if (OB_LIKELY(nullptr != cs_) && OB_LIKELY(!l_datum.is_null()) && OB_LIKELY(!r_datum.is_null())) {
+      const int res = cs_->coll->strnncollsp(cs_,
+                                             reinterpret_cast<const unsigned char *>(l_datum.ptr_),
+                                             l_datum.len_,
+                                             reinterpret_cast<const unsigned char *>(r_datum.ptr_),
+                                             r_datum.len_,
+                                             cmp_end_space_);
+      cmp_ret = res > 0 ? 1 : (res < 0 ? -1 : 0);
+    } else if (OB_FAIL(cmp_func_(l_datum, r_datum, tmp_ret, nullptr))) {
     } else {
       cmp_ret = tmp_ret;
     }
