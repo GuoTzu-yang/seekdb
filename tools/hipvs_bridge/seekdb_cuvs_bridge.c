@@ -92,7 +92,7 @@ static void sk_apply_build_knobs(cuvsCagraIndexParams_t ip)
   int degree = -1;
   int idegree = -1;
   if (ip == NULL) return;
-  niter = sk_env_int("OB_CUVS_NN_ITER", -1, 1, 400);
+  niter = sk_env_int("OB_CUVS_NN_ITER", 20, 1, 400);
   if (niter > 0) ip->nn_descent_niter = niter;
   degree = sk_env_int("OB_CUVS_GRAPH_DEGREE", -1, 8, 512);
   if (degree > 0) ip->graph_degree = degree;
