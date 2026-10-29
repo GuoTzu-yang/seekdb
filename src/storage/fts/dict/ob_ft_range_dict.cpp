@@ -382,18 +382,32 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
+  // Ranges are cut sequentially from an ascending dictionary stream, so start_ is
+  // increasing and the ranges are pairwise disjoint: "the range containing w" is the
+  // last range whose start_ <= w, provided w <= its end_. Binary search instead of a
+  // linear scan that ran two collation strcmps per range on every character.
+  int64_t low = 0;
+  int64_t high = range_dicts_.size() - 1;
+  int64_t candidate = -1;
+  while (low <= high) {
+    const int64_t mid = low + ((high - low) >> 1);
     if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
+                          range_dicts_[mid].start_.get_word(),
                           single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
-      found = true;
+        <= 0) {
+      candidate = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
     }
+  }
+  if (candidate >= 0
+      && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                           range_dicts_[candidate].end_.get_word(),
+                           single_word)
+             >= 0) {
+    dict = range_dicts_[candidate].dict_;
+    found = true;
   }
   if (!found) {
     // not found, dis match

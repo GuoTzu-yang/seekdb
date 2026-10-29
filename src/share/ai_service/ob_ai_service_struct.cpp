@@ -37,7 +37,8 @@ const char *VALID_PROVIDERS[] = {
   "SILICONFLOW",
   "COHERE",
   "HUNYUAN-OPENAI",
-  "OPENAI"
+  "OPENAI",
+  "OLLAMA"
 };
 
 #define EXTRACT_JSON_ELEM_STR(json_key, member) \
@@ -112,7 +113,7 @@ int ObAiModelEndpointInfo::check_valid() const
   } else if (url_.empty()) {
     ret = OB_AI_FUNC_PARAM_EMPTY;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("url"), "url");
-  } else if (access_key_.empty()) {
+  } else if (access_key_.empty() && provider_.case_compare("OLLAMA") != 0) {
     ret = OB_AI_FUNC_PARAM_EMPTY;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("access_key"), "access_key");
     LOG_WARN("access_key is empty", K(ret), K(*this));
@@ -192,7 +193,10 @@ int ObAiModelEndpointInfo::encrypt_access_key_(ObIAllocator &allocator, const Ob
 int ObAiModelEndpointInfo::decrypt_access_key_(ObIAllocator &allocator, const ObString &encrypted_access_key, ObString &unencrypted_access_key) const
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ob_write_string(allocator, encrypted_access_key, unencrypted_access_key))) {
+  if (encrypted_access_key.empty()) {
+    // Ollama 等无需鉴权的 provider，access_key 允许为空，直接透传空串
+    unencrypted_access_key.reset();
+  } else if (OB_FAIL(ob_write_string(allocator, encrypted_access_key, unencrypted_access_key))) {
   }
   return ret;
 }

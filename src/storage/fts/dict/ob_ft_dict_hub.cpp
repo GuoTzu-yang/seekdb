@@ -28,6 +28,13 @@ namespace oceanbase
 {
 namespace storage
 {
+static int64_t g_ob_fts_dict_epoch = 0;
+
+int64_t ob_fts_dict_epoch()
+{
+  return __atomic_load_n(&g_ob_fts_dict_epoch, __ATOMIC_RELAXED);
+}
+
 int ObFTDictHub::init()
 {
   static constexpr int K_MAX_DICT_BUCKET = 128; // for now, only built-in dicts.
@@ -79,6 +86,10 @@ int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &
         }
       }
     }
+  }
+  if (OB_SUCC(ret)) {
+    // a dictionary cache was (re)built: invalidate derived memos
+    __atomic_add_fetch(&g_ob_fts_dict_epoch, 1, __ATOMIC_RELAXED);
   }
   return ret;
 }

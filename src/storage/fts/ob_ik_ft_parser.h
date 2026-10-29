@@ -31,6 +31,52 @@ namespace storage
 {
 class ObFTDictHub;
 
+
+// Every segmentation used to rebuild the whole ik dictionary layer: three
+// hub->load_cache() calls, one locked KV-cache get plus one handle allocation per
+// dictionary range, then a fresh ObFTRangeDict and one ObFTCacheDict per range. All of
+// that is derived from immutable data, so it is pinned here instead: one bundle per
+// thread, rebuilt only when the dictionary epoch changes (ObFTDictHub::build_cache bumps
+// it when a dictionary cache is (re)built).
+class ObIKDictBundle
+{
+public:
+  ObIKDictBundle();
+  ~ObIKDictBundle() = default;
+
+  // Per-thread instance; intentionally leaked so that borrowed dictionaries always
+  // outlive the parsers using them.
+  static ObIKDictBundle &instance();
+
+  int obtain(ObFTDictHub *hub,
+             ObIFTDict *&main_dict,
+             ObIFTDict *&quan_dict,
+             ObIFTDict *&stop_dict);
+
+private:
+  int build(ObFTDictHub *hub);
+  int load_container(ObFTDictHub *hub,
+                     const ObFTDictDesc &desc,
+                     ObFTCacheRangeContainer &container);
+  int build_dict(const ObFTDictDesc &desc,
+                 ObFTCacheRangeContainer &container,
+                 ObIFTDict *&dict);
+  void destroy();
+
+private:
+  ObArenaAllocator alloc_;
+  ObFTCacheRangeContainer cache_main_;
+  ObFTCacheRangeContainer cache_quan_;
+  ObFTCacheRangeContainer cache_stop_;
+  ObIFTDict *main_dict_;
+  ObIFTDict *quan_dict_;
+  ObIFTDict *stop_dict_;
+  int64_t epoch_;
+  bool inited_;
+
+  DISABLE_COPY_ASSIGN(ObIKDictBundle);
+};
+
 class ObIKFTParser final : public ObITokenIterator
 {
 public:
@@ -46,7 +92,8 @@ public:
         cache_stop_(allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
-        dict_stop_(nullptr)
+        dict_stop_(nullptr),
+        dict_borrowed_(false)
   {
   }
 
@@ -73,6 +120,8 @@ private:
 
 private:
   int init_dict(const ObFTParserParam &param);
+
+  int init_dict_from_bundle();
 
   int init_single_dict(ObFTDictDesc desc, ObFTCacheRangeContainer &container);
 
@@ -106,6 +155,8 @@ private:
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
   ObIFTDict *dict_stop_;
+  // true when the dictionaries are borrowed read-only from ObIKDictBundle
+  bool dict_borrowed_;
 
   DISABLE_COPY_ASSIGN(ObIKFTParser);
 };

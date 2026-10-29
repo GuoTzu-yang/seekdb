@@ -93,6 +93,10 @@ private:
 };
 
 class ObFTCacheRangeContainer;
+// Monotonic counter, bumped whenever a fulltext dictionary cache is built or
+// rebuilt. Consumers that cache anything derived from a dictionary compare it.
+int64_t ob_fts_dict_epoch();
+
 class ObFTDictHub
 {
 public:

@@ -16,6 +16,9 @@
 
 #include "sql/engine/expr/ob_expr_tokenize.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #include "lib/alloc/alloc_struct.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
@@ -28,6 +31,7 @@
 #include "object/ob_object.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "share/ob_json_access_utils.h"
+#include "storage/fts/dict/ob_ft_dict_hub.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
@@ -39,6 +43,188 @@ namespace oceanbase
 {
 namespace sql
 {
+
+namespace {
+
+// tokenize(text, parser[, args]) is a pure function of its arguments: the parser
+// name/properties are compiled into an immutable ObFTParserProperty, and the ik
+// dictionaries are static text loaded once per process. Therefore the same input
+// always produces the same JSON value. Bulk workloads that tokenize the same text
+// repeatedly used to pay the whole "parse params -> pin dictionaries -> segment ->
+// build JSON tree -> serialize" chain on every single call. Memoize the finished
+// JSON binary in a small bounded per-thread table keyed by
+// (parser name, parser properties, meta, output mode, fulltext).
+constexpr int64_t TOKENIZE_CACHE_MAX_ENTRIES = 8;
+constexpr int64_t TOKENIZE_CACHE_MAX_KEY_LEN = 4608;
+constexpr int64_t TOKENIZE_CACHE_MAX_VALUE_LEN = 16 * 1024;
+
+struct ObTokenizeCacheEntry
+{
+  ObTokenizeCacheEntry()
+      : hash_(0), key_len_(0), value_len_(0), key_(nullptr), value_(nullptr), used_at_(0) {}
+  uint64_t hash_;
+  int64_t key_len_;
+  int64_t value_len_;
+  char *key_;
+  char *value_;
+  uint64_t used_at_;
+};
+
+class ObTokenizeResultCache
+{
+public:
+  ObTokenizeResultCache() : used_at_(0) {}
+  ~ObTokenizeResultCache()
+  {
+    for (int64_t i = 0; i < TOKENIZE_CACHE_MAX_ENTRIES; ++i) {
+      release(entries_[i]);
+    }
+  }
+
+  static ObTokenizeResultCache &instance()
+  {
+    // Leaked on purpose: the memo table owns plain malloc'd bytes, but keeping it
+    // alive for the whole thread lifetime avoids any teardown-order coupling.
+    static thread_local ObTokenizeResultCache *cache = new ObTokenizeResultCache();
+    return *cache;
+  }
+
+  int get(const uint64_t hash, const char *key, const int64_t key_len, ObString &value)
+  {
+    int ret = OB_ENTRY_NOT_EXIST;
+    for (int64_t i = 0; OB_ENTRY_NOT_EXIST == ret && i < TOKENIZE_CACHE_MAX_ENTRIES; ++i) {
+      ObTokenizeCacheEntry &entry = entries_[i];
+      if (OB_NOT_NULL(entry.key_)
+          && entry.hash_ == hash
+          && entry.key_len_ == key_len
+          && 0 == ::memcmp(entry.key_, key, static_cast<size_t>(key_len))) {
+        entry.used_at_ = ++used_at_;
+        value.assign_ptr(entry.value_, static_cast<int32_t>(entry.value_len_));
+        ret = OB_SUCCESS;
+      }
+    }
+    return ret;
+  }
+
+  int put(const uint64_t hash, const char *key, const int64_t key_len, const ObString &value)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_UNLIKELY(key_len <= 0 || key_len > TOKENIZE_CACHE_MAX_KEY_LEN
+                    || value.empty() || value.length() > TOKENIZE_CACHE_MAX_VALUE_LEN)) {
+      // not worth/possible to cache, just skip
+    } else {
+      int64_t victim = -1;
+      for (int64_t i = 0; victim < 0 && i < TOKENIZE_CACHE_MAX_ENTRIES; ++i) {
+        if (OB_ISNULL(entries_[i].key_)) {
+          victim = i;
+        }
+      }
+      if (victim < 0) {
+        victim = 0;
+        for (int64_t i = 1; i < TOKENIZE_CACHE_MAX_ENTRIES; ++i) {
+          if (entries_[i].used_at_ < entries_[victim].used_at_) {
+            victim = i;
+          }
+        }
+      }
+      ObTokenizeCacheEntry &entry = entries_[victim];
+      release(entry);
+      char *key_buf = static_cast<char *>(::malloc(static_cast<size_t>(key_len)));
+      char *value_buf = static_cast<char *>(::malloc(static_cast<size_t>(value.length())));
+      if (OB_ISNULL(key_buf) || OB_ISNULL(value_buf)) {
+        ::free(key_buf);
+        ::free(value_buf);
+      } else {
+        ::memcpy(key_buf, key, static_cast<size_t>(key_len));
+        ::memcpy(value_buf, value.ptr(), static_cast<size_t>(value.length()));
+        entry.hash_ = hash;
+        entry.key_len_ = key_len;
+        entry.value_len_ = value.length();
+        entry.key_ = key_buf;
+        entry.value_ = value_buf;
+        entry.used_at_ = ++used_at_;
+      }
+    }
+    return ret;
+  }
+
+private:
+  static void release(ObTokenizeCacheEntry &entry)
+  {
+    if (OB_NOT_NULL(entry.key_)) {
+      ::free(entry.key_);
+      entry.key_ = nullptr;
+    }
+    if (OB_NOT_NULL(entry.value_)) {
+      ::free(entry.value_);
+      entry.value_ = nullptr;
+    }
+    entry.hash_ = 0;
+    entry.key_len_ = 0;
+    entry.value_len_ = 0;
+    entry.used_at_ = 0;
+  }
+
+private:
+  ObTokenizeCacheEntry entries_[TOKENIZE_CACHE_MAX_ENTRIES];
+  uint64_t used_at_;
+};
+
+inline uint64_t tokenize_cache_hash(const char *data, const int64_t len)
+{
+  uint64_t hash = 1469598103934665603ULL; // FNV-1a 64 bit
+  for (int64_t i = 0; i < len; ++i) {
+    hash ^= static_cast<uint64_t>(static_cast<unsigned char>(data[i]));
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+// Serialize the memo key: [meta+mode][parser name]\0[parser properties]\0[fulltext]
+// Returns false when the payload does not fit the bounded stack buffer (skip caching).
+bool build_tokenize_cache_key(const ObString &parser_name,
+                              const ObString &properties,
+                              const ObObjMeta &meta,
+                              const ObString &fulltext,
+                              const int output_mode,
+                              const int64_t dict_epoch,
+                              char *buf,
+                              const int64_t buf_len,
+                              int64_t &key_len)
+{
+  key_len = 0;
+  const int64_t meta_desc_size = static_cast<int64_t>(sizeof(int64_t));
+  const int64_t payload = 2 * meta_desc_size + parser_name.length() + properties.length()
+                          + fulltext.length() + 2; // 2 x '\0' separators
+  bool ok = false;
+  if (OB_NOT_NULL(buf) && payload > 0 && payload <= buf_len) {
+    int64_t pos = 0;
+    const int64_t meta_desc = static_cast<int64_t>(meta.get_collation_type()) * 8 + output_mode;
+    ::memcpy(buf + pos, &meta_desc, static_cast<size_t>(meta_desc_size));
+    pos += meta_desc_size;
+    ::memcpy(buf + pos, &dict_epoch, static_cast<size_t>(meta_desc_size));
+    pos += meta_desc_size;
+    if (parser_name.length() > 0) {
+      ::memcpy(buf + pos, parser_name.ptr(), static_cast<size_t>(parser_name.length()));
+      pos += parser_name.length();
+    }
+    buf[pos++] = '\0';
+    if (properties.length() > 0) {
+      ::memcpy(buf + pos, properties.ptr(), static_cast<size_t>(properties.length()));
+      pos += properties.length();
+    }
+    buf[pos++] = '\0';
+    if (fulltext.length() > 0) {
+      ::memcpy(buf + pos, fulltext.ptr(), static_cast<size_t>(fulltext.length()));
+      pos += fulltext.length();
+    }
+    key_len = pos;
+    ok = true;
+  }
+  return ok;
+}
+
+} // anonymous namespace
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -64,12 +250,38 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else {
+    char key_buf[TOKENIZE_CACHE_MAX_KEY_LEN];
+    int64_t key_len = 0;
+    // The memo key carries the dictionary epoch, so a rebuilt dictionary naturally
+    // invalidates every entry instead of poisoning the table.
+    const bool cacheable = build_tokenize_cache_key(param.parser_name_,
+                                                       param.properties_,
+                                                       param.meta_,
+                                                       param.fulltext_,
+                                                       static_cast<int>(param.output_mode_),
+                                                       storage::ob_fts_dict_epoch(),
+                                                       key_buf,
+                                                       static_cast<int64_t>(sizeof(key_buf)),
+                                                       key_len);
+    ObTokenizeResultCache &cache = ObTokenizeResultCache::instance();
+    const uint64_t cache_hash = cacheable ? tokenize_cache_hash(key_buf, key_len) : 0;
+    ObString cached;
+    if (cacheable && OB_SUCC(cache.get(cache_hash, key_buf, key_len, cached))) {
+      if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, cached))) {
+        LOG_WARN("failed to pack the memoized tokenize result", K(ret));
+      }
+    } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+    } else {
+      ObString raw_binary;
+      if (OB_FAIL(share::ObJsonWrapper::get_raw_binary(json_result, raw_binary, &temp_allocator))) {
+        LOG_WARN("failed to serialize the tokenize result", K(ret));
+      } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, raw_binary))) {
+      } else if (cacheable) {
+        // best effort: a failed memo put must never fail the query
+        cache.put(cache_hash, key_buf, key_len, raw_binary);
+      }
+    }
   }
 
   return ret;
