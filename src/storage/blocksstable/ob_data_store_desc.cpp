@@ -82,10 +82,9 @@ void ObStaticDataStoreDesc::init_block_size(const ObMergeSchema &merge_schema)
   } else {
     macro_store_size_ = macro_block_size_ * DEFAULT_RESERVE_PERCENT / 100;
   }
-  micro_block_size_limit_ = macro_block_size_
-    - ObMacroBlockCommonHeader::get_serialize_size()
-    - ObSSTableMacroBlockHeader::get_fixed_header_size()
-    - MIN_RESERVED_SIZE;
+  // Keep micro blocks small so a scan decodes a bounded number of rows per
+  // block instead of materialising a whole macro block worth of them.
+  micro_block_size_limit_ = MICRO_BLOCK_SIZE_LIMIT_FOR_SCAN;
 }
 
 int ObStaticDataStoreDesc::init(
