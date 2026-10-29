@@ -584,18 +584,72 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
   return ret;
 }
 
+namespace {
+// Rebuilding the parser properties is a JSON round trip whose result depends only
+// on (parser name, properties) - both constants for a given statement.  Cache the
+// last few results per thread in fixed storage so a repeated TOKENIZE call is a
+// length check plus pointer assignment.  Fixed slots keep the cache bounded and
+// allocation free, and a slot is only reused once all of its keys are compared.
+struct ObTokenizePropSlot
+{
+  static const int64_t MAX_BYTES = 512;
+  char key_[MAX_BYTES];
+  char val_[MAX_BYTES];
+  int64_t key_len_;
+  int32_t val_len_;
+  ObTokenizePropSlot() : key_len_(-1), val_len_(0) { MEMSET(key_, 0, sizeof(key_)); }
+};
+
+struct ObTokenizePropCache
+{
+  static const int64_t SLOT_CNT = 8;
+  ObTokenizePropSlot slots_[SLOT_CNT];
+  int64_t next_;
+  ObTokenizePropCache() : next_(0) {}
+};
+} // namespace
+
 int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParserJsonProps parser_properties;
+  static thread_local ObTokenizePropCache prop_cache;
+  const int64_t name_len = parser_name_.length();
+  const int64_t prop_len = properties.length();
+  const int64_t total = name_len + prop_len;
+  const bool cacheable = total > 0 && total <= ObTokenizePropSlot::MAX_BYTES;
+  ObTokenizePropSlot *hit = nullptr;
 
-  if (OB_FAIL(parser_properties.init())) {
-  } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
-  } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
-                                                             ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                                                             true))) {
-  } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  if (cacheable) {
+    for (int64_t i = 0; OB_ISNULL(hit) && i < ObTokenizePropCache::SLOT_CNT; ++i) {
+      ObTokenizePropSlot &slot = prop_cache.slots_[i];
+      if (slot.key_len_ == total
+          && 0 == MEMCMP(slot.key_, parser_name_.ptr(), name_len)
+          && 0 == MEMCMP(slot.key_ + name_len, properties.ptr(), prop_len)) {
+        hit = &slot;
+      }
+    }
+  }
+
+  if (nullptr != hit) {
+    properties_.assign_ptr(hit->val_, hit->val_len_);
+  } else {
+    storage::ObFTParserJsonProps parser_properties;
+    if (OB_FAIL(parser_properties.init())) {
+    } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
+    } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
+                                                               ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                                               true))) {
+    } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+    } else if (cacheable && properties_.length() <= ObTokenizePropSlot::MAX_BYTES) {
+      ObTokenizePropSlot &slot = prop_cache.slots_[prop_cache.next_];
+      prop_cache.next_ = (prop_cache.next_ + 1) % ObTokenizePropCache::SLOT_CNT;
+      MEMCPY(slot.key_, parser_name_.ptr(), name_len);
+      MEMCPY(slot.key_ + name_len, properties.ptr(), prop_len);
+      MEMCPY(slot.val_, properties_.ptr(), properties_.length());
+      slot.key_len_ = total;
+      slot.val_len_ = properties_.length();
+    }
   }
 
   return ret;

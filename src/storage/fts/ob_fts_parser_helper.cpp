@@ -324,6 +324,46 @@ ObFTParseHelper::~ObFTParseHelper()
   reset();
 }
 
+namespace {
+// A TOKENIZE statement always resolves the same parser name, and the built-in
+// parser table is immutable after startup.  parse_from_str walks every
+// registered parser and compares names, then get_desc looks the descriptor up
+// again, so cache the last resolution per thread.
+struct ObFTLocalParserCache
+{
+  char name_[64];
+  int64_t len_;
+  ObFTParser parser_;
+  const ObIFTParserDesc *desc_;
+  ObFTLocalParserCache() : name_(), len_(0), parser_(), desc_(nullptr) {}
+};
+
+int resolve_parser_cached(const common::ObString &name,
+                          ObFTParser &parser,
+                          const ObIFTParserDesc *&desc)
+{
+  int ret = OB_SUCCESS;
+  thread_local ObFTLocalParserCache cache;
+  if (OB_UNLIKELY(name.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (cache.len_ == name.length() && nullptr != cache.desc_
+             && 0 == MEMCMP(cache.name_, name.ptr(), name.length())) {
+    parser = cache.parser_;
+    desc = cache.desc_;
+  } else {
+    if (OB_FAIL(parser.parse_from_str(name.ptr(), name.length()))) {
+    } else if (OB_FAIL(parser.get_desc(desc))) {
+    } else if (name.length() < static_cast<int64_t>(sizeof(cache.name_))) {
+      MEMCPY(cache.name_, name.ptr(), name.length());
+      cache.len_ = name.length();
+      cache.parser_ = parser;
+      cache.desc_ = desc;
+    }
+  }
+  return ret;
+}
+} // namespace
+
 int ObFTParseHelper::init(
     common::ObIAllocator *allocator,
     const common::ObString &parser_name,
@@ -334,9 +374,8 @@ int ObFTParseHelper::init(
     ret = OB_INIT_TWICE;
   } else if (OB_ISNULL(allocator) || OB_UNLIKELY(parser_name.empty())) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(parser_name_.parse_from_str(parser_name.ptr(), parser_name.length()))) {
+  } else if (OB_FAIL(resolve_parser_cached(parser_name, parser_name_, parser_desc_))) {
   } else if (OB_FAIL(parser_property_.parse_for_parser_helper(parser_name_, parser_properties))) {
-  } else if (OB_FAIL(parser_name_.get_desc(parser_desc_))) {
   } else if (OB_ISNULL(parser_desc_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(set_add_word_flag(*parser_desc_))) {
