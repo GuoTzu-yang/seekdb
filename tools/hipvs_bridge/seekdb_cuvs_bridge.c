@@ -187,7 +187,12 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   dset.dl_tensor.shape = ds; dset.dl_tensor.strides = 0; dset.dl_tensor.byte_offset = 0;
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
-  h->ip->build_algo = NN_DESCENT;
+  /* [contest] 基线硬编码 NN_DESCENT；cuVS/hipVS 的库默认是 AUTO_SELECT，
+   * 通常解析为 IVF_PQ —— 只用 PQ 生成初始 kNN 图，最终图仍在
+   * intermediate_graph_degree 上按原始向量精化，因此召回可控而建图显著更快。
+   * 0=AUTO_SELECT(默认) 1=IVF_PQ 2=NN_DESCENT 3=ITERATIVE_CAGRA_SEARCH */
+  h->ip->build_algo = (cuvsCagraGraphBuildAlgo)
+      sk_env_int("OB_CUVS_BUILD_ALGO", 0, 0, 3);
   h->ip->graph_degree = 128;
   h->ip->intermediate_graph_degree = 256;
   h->ip->nn_descent_niter = 100;
