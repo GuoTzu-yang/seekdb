@@ -247,24 +247,38 @@ int ObFTDATBuilder<DATA_TYPE>::encode(const ObString &word, ObFTWordCode &code, 
 }
 
 template <typename DATA_TYPE>
-int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
-                                             const ObDATrieHit &last_hit,
-                                             ObDATrieHit &hit) const
+int ObFTDATReader<DATA_TYPE>::get_code(const ObString &ft_char,
+                                       ObFTWordCode &code,
+                                       bool &found) const
 {
   int ret = OB_SUCCESS;
-  ObFTWordCode code;
-  hit.set_unmatch();
-  auto *map = dat_->get_map();
-  int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
-  int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
-
+  found = false;
   ObFTSingleWord word;
   word.set_word(ft_char.ptr(), ft_char.length());
-  if (OB_FAIL(dat_->get_map()->find(word, code)) && OB_ENTRY_NOT_EXIST != ret) {
-  } else if (OB_ENTRY_NOT_EXIST == ret) {
+  ret = dat_->get_map()->find(word, code);
+  if (OB_ENTRY_NOT_EXIST == ret) {
     ret = OB_SUCCESS;
-    hit.set_unmatch();
+  } else if (OB_SUCC(ret)) {
+    found = true;
+  }
+  return ret;
+}
+
+template <typename DATA_TYPE>
+int ObFTDATReader<DATA_TYPE>::match_with_hit_by_code(const ObString &ft_char,
+                                                     const ObFTWordCode code,
+                                                     const bool found,
+                                                     const ObDATrieHit &last_hit,
+                                                     ObDATrieHit &hit) const
+{
+  int ret = OB_SUCCESS;
+  hit.set_unmatch();
+  if (!found) {
+    // the character does not appear in this dictionary block: the hit cannot
+    // advance and stays unmatched
   } else {
+    int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
+    int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
     if (&last_hit == &hit) {
       // sameone
     } else {
@@ -290,6 +304,20 @@ int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
       hit.char_cnt_++;
       hit.set_prefix();
     }
+  }
+  return ret;
+}
+
+template <typename DATA_TYPE>
+int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
+                                             const ObDATrieHit &last_hit,
+                                             ObDATrieHit &hit) const
+{
+  int ret = OB_SUCCESS;
+  ObFTWordCode code = 0;
+  bool found = false;
+  if (OB_FAIL(get_code(ft_char, code, found))) {
+  } else if (OB_FAIL(match_with_hit_by_code(ft_char, code, found, last_hit, hit))) {
   }
   return ret;
 }

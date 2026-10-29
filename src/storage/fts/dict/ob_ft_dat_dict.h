@@ -174,6 +174,16 @@ public:
                      const ObDATrieHit &last_hit,
                      ObDATrieHit &hit) const;
 
+  // Resolve the trie code of one character inside this dictionary block.
+  int get_code(const ObString &single_word, ObFTWordCode &code, bool &found) const;
+
+  // Advance a hit using a code that get_code() already resolved.
+  int match_with_hit_by_code(const ObString &single_word,
+                             const ObFTWordCode code,
+                             const bool found,
+                             const ObDATrieHit &last_hit,
+                             ObDATrieHit &hit) const;
+
 private:
   ObFTDAT *dat_;
 

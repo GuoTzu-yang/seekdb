@@ -1,0 +1,43 @@
+# owner: zhuhaoran(17754870723@163.com)
+# owner group: storage
+# description: check the tokenizer on the characters that decide the character
+#              length and the Chinese numeral lookup.
+
+--disable_warnings
+drop database if exists fts_char_boundary;
+create database fts_char_boundary;
+use fts_char_boundary;
+set ob_query_timeout = 10000000000;
+
+create table memo (id BIGINT AUTO_INCREMENT PRIMARY KEY, body VARCHAR(256) NOT NULL, FULLTEXT INDEX fti(body) WITH PARSER ik);
+--enable_warnings
+
+--result_format 4
+
+# the Chinese numerals are grouped into a single token
+select tokenize('一二三四五六七八九十', 'ik');
+select tokenize('零壹贰叁肆伍陆柒捌玖拾', 'ik');
+select tokenize('第123章', 'ik');
+
+# a character outside the basic multilingual plane is not a token
+select tokenize('数据库😀', 'ik');
+
+# the full width characters keep their own classification
+select tokenize('ＡＢＣ数据库', 'ik');
+
+# a latin word between two Chinese words
+select tokenize('数据库abc数据库', 'ik');
+
+# the default parser is the ik parser
+select tokenize('第一章第三节');
+
+--disable_warnings
+insert into memo (body) values
+  ('第一章第三节'),
+  ('第123章'),
+  ('零壹贰叁肆伍陆柒捌玖拾');
+--enable_warnings
+
+select count(*) from memo where match(body) against('第一章第三节');
+select count(*) from memo where match(body) against('第123章');
+select count(*) from memo where match(body) against('零壹贰叁肆伍陆柒捌玖拾');

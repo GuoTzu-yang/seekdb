@@ -22,6 +22,7 @@
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "storage/fts/dict/ob_ft_dict.h"
+#include "storage/fts/dict/ob_ft_cache_dict.h"
 #include "storage/fts/ik/ob_ik_char_util.h"
 #include "storage/fts/ik/ob_ik_token.h"
 
@@ -38,11 +39,29 @@ int ObIKCJKProcessor::do_process(TokenizeContext &ctx,
 
   if (ObFTCharUtil::CharType::USELESS != type) {
     // handle previous hits_ first and then check from this char
+    // match_with_hit resolves the character to a trie code with a hash lookup
+    // on every call. That lookup only depends on the character and on the
+    // dictionary block a hit belongs to, so resolve it once per (block,
+    // character) instead of once per active hit.
+    const ObFTCacheDict *code_dict = nullptr;
+    ObFTWordCode code = 0;
+    bool code_found = false;
+    const ObString char_str(char_len, ch);
     for (ObList<ObDATrieHit, ObIAllocator>::iterator iter = hits_.begin();
          OB_SUCC(ret) && iter != hits_.end();
          iter++) {
       ObDATrieHit &hit = *iter;
-      if (OB_FAIL(dict_main_.match_with_hit({char_len, ch}, hit, hit))) {
+      const ObFTCacheDict *hit_dict = static_cast<const ObFTCacheDict *>(hit.dict_);
+      if (OB_ISNULL(hit_dict)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (hit_dict != code_dict) {
+        if (OB_FAIL(hit_dict->get_code(char_str, code, code_found))) {
+        } else {
+          code_dict = hit_dict;
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(code_dict->match_with_hit_by_code(char_str, code, code_found, hit, hit))) {
       } else if (hit.is_match()) {
         if (OB_FAIL(ctx.add_token(ctx.fulltext(),
                                   hit.start_pos_,

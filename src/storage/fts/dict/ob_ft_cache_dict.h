@@ -44,6 +44,19 @@ public:
                      const ObDATrieHit &last_hit,
                      ObDATrieHit &hit) const override;
 
+  int get_code(const ObString &single_word, ObFTWordCode &code, bool &found) const
+  {
+    return reader_.get_code(single_word, code, found);
+  }
+  int match_with_hit_by_code(const ObString &single_word,
+                             const ObFTWordCode code,
+                             const bool found,
+                             const ObDATrieHit &last_hit,
+                             ObDATrieHit &hit) const
+  {
+    return reader_.match_with_hit_by_code(single_word, code, found, last_hit, hit);
+  }
+
 public:
   static int make_and_fetch_cache_entry(const ObFTDictDesc &desc,
                                         ObFTDAT *dat_buff,
