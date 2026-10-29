@@ -12251,6 +12251,56 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     }
   }
   if (OB_SUCC(ret)) {
+    // A natural-language MATCH used only as a boolean WHERE predicate does
+    // not expose BM25 scores. Any index entry matches with a positive score,
+    // so the retrieval iterator can use presence instead of calculating BM25.
+    // Keep scoring for projections, ordering, grouping and complex filters.
+    if (get_stmt()->is_select_stmt()
+        && match_against->get_mode_flag() == NATURAL_LANGUAGE_MODE
+        && get_stmt()->get_from_items().count() == 1
+        && get_stmt()->get_joined_tables().empty()) {
+      const ObSelectStmt *stmt = static_cast<const ObSelectStmt *>(get_stmt());
+      bool predicate_only = true;
+      bool has_direct_match_filter = false;
+      for (int64_t i = 0; predicate_only && i < stmt->get_select_items().count(); ++i) {
+        const ObRawExpr *expr = stmt->get_select_items().at(i).expr_;
+        predicate_only = nullptr != expr && expr != match_against
+                         && !expr->has_flag(CNT_MATCH_EXPR);
+      }
+      for (int64_t i = 0; predicate_only && i < stmt->get_order_items().count(); ++i) {
+        const ObRawExpr *expr = stmt->get_order_items().at(i).expr_;
+        predicate_only = nullptr != expr && expr != match_against
+                         && !expr->has_flag(CNT_MATCH_EXPR);
+      }
+      for (int64_t i = 0; predicate_only && i < stmt->get_group_exprs().count(); ++i) {
+        const ObRawExpr *expr = stmt->get_group_exprs().at(i);
+        predicate_only = nullptr != expr && expr != match_against
+                         && !expr->has_flag(CNT_MATCH_EXPR);
+      }
+      for (int64_t i = 0; predicate_only && i < stmt->get_having_exprs().count(); ++i) {
+        const ObRawExpr *expr = stmt->get_having_exprs().at(i);
+        predicate_only = nullptr != expr && expr != match_against
+                         && !expr->has_flag(CNT_MATCH_EXPR);
+      }
+      for (int64_t i = 0; predicate_only && i < stmt->get_condition_exprs().count(); ++i) {
+        const ObRawExpr *expr = stmt->get_condition_exprs().at(i);
+        if (nullptr == expr) {
+          predicate_only = false;
+        } else if (expr == match_against || expr->has_flag(CNT_MATCH_EXPR)) {
+          if (expr->get_expr_type() == T_OP_BOOL
+              && expr->get_param_count() == 1
+              && expr->get_param_expr(0) == match_against) {
+            has_direct_match_filter = true;
+          } else {
+            predicate_only = false;
+          }
+        }
+      }
+      if (predicate_only && has_direct_match_filter
+          && stmt->get_match_exprs().count() == 1) {
+        need_calc_relevance = false;
+      }
+    }
     /*
     if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(get_optimizer_context().get_exec_ctx(),
                                                               get_stmt(),

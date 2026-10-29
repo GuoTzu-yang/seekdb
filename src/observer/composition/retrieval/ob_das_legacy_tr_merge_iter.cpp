@@ -473,15 +473,20 @@ int ObDASLegacyTRMergeIter::init_daat_iter_param(ObTextDaaTParam &iter_param)
   iter_param.allocator_ = &myself_allocator_;
   iter_param.mode_flag_ = ir_ctdef_->mode_flag_;
   iter_param.function_lookup_mode_ = function_lookup_mode_;
+  // A predicate-only MATCH carries no score projection, so the plan builds no
+  // document-count aggregate subplan; dereferencing it here would crash.
+  const auto *doc_agg_ctdef = ir_ctdef_->get_doc_agg_ctdef();
   iter_param.bm25_param_est_ctx_.total_doc_cnt_expr_
-      = ir_ctdef_->get_doc_agg_ctdef()->pd_expr_spec_.pd_storage_aggregate_output_.at(0);
+      = OB_ISNULL(doc_agg_ctdef)
+            ? nullptr
+            : doc_agg_ctdef->pd_expr_spec_.pd_storage_aggregate_output_.at(0);
   iter_param.bm25_param_est_ctx_.estimated_total_doc_cnt_ = ir_ctdef_->estimated_total_doc_cnt_;
   iter_param.bm25_param_est_ctx_.need_est_avg_doc_token_cnt_ = ir_ctdef_->need_avg_doc_len_est();
   iter_param.bm25_param_est_ctx_.can_est_by_sum_skip_index_ = ir_ctdef_->avg_doc_len_est_spec_.can_est_by_sum_skip_index_;
   iter_param.bm25_param_est_ctx_.avg_doc_token_cnt_expr_ = ir_ctdef_->avg_doc_token_cnt_expr_;
   iter_param.bm25_param_est_ctx_.doc_length_est_param_ = &doc_length_est_param_;
-  if (query_tokens_.count() == 0) {
-    // do nothing
+  if (!ir_ctdef_->need_calc_relevance() || query_tokens_.count() == 0) {
+    // Presence-only retrieval needs no BM25 statistics at all.
   } else if (OB_ISNULL(iter_param.bm25_param_est_ctx_.total_doc_cnt_expr_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(init_doc_length_est_param())) {
