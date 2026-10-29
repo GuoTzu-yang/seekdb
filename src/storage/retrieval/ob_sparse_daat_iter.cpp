@@ -346,12 +346,33 @@ int ObSRDaaTIterImpl::process_collected_row(const ObDatum &id_datum, const doubl
   return OB_SUCCESS;
 }
 
+static bool can_batch_score_filter(const ObSparseRetrievalMergeParam &param)
+{
+  const ObExpr *filter = param.filter_expr_;
+  const ObExpr *score = param.relevance_proj_expr_;
+  return param.eval_ctx_->is_vectorized() && nullptr != filter && nullptr != score
+      && filter->is_batch_result() && filter->type_ == T_OP_BOOL
+      && filter->arg_cnt_ == 1 && filter->args_[0] == score
+      && score->datum_meta_.type_ == ObDoubleType;
+}
+
 int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevance, bool &need_project)
 {
   int ret = OB_SUCCESS;
   ObExpr *filter_expr = iter_param_->filter_expr_;
   ObExpr *relevance_proj_expr = iter_param_->relevance_proj_expr_;
   ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
+  if (can_batch_score_filter(*iter_param_)) {
+    if (OB_UNLIKELY(count >= eval_ctx->max_batch_size_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      // Only accepted rows enter the output batch. Materialize their true
+      // filter values in project_results, rather than updating a frame and
+      // evaluated bit for every candidate (including OFFSET-discarded rows).
+      need_project = (0 != relevance);
+    }
+    return ret;
+  }
   ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
 
   if (!iter_param_->need_filter()) {
@@ -361,15 +382,26 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
       ret = OB_ERR_UNEXPECTED;
     } else {
       guard.set_batch_idx(count);
-      ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
-      relevance_proj_datum.set_double(relevance);
-      relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(count);
-      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
-      ObDatum *filter_res = nullptr;
-      filter_expr->clear_evaluated_flag(*eval_ctx);
-      if (OB_FAIL(filter_expr->eval(*eval_ctx, filter_res))) {
+      if (filter_expr->type_ == T_OP_BOOL && filter_expr->arg_cnt_ == 1
+          && filter_expr->args_[0] == relevance_proj_expr
+          && relevance_proj_expr->datum_meta_.type_ == ObDoubleType) {
+        // This filter depends only on the collected score. Preserve the exact
+        // double-to-BOOL conversion; project_results writes the accepted scores
+        // in one batch, so do not materialize them a second time here.
+        need_project = (0 != relevance);
+        filter_expr->locate_datum_for_write(*eval_ctx).set_int32(need_project ? 1 : 0);
+        filter_expr->set_evaluated_flag(*eval_ctx);
       } else {
-        need_project = !(filter_res->is_null() || 0 == filter_res->get_int());
+        ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+        relevance_proj_datum.set_double(relevance);
+        relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(count);
+        relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+        ObDatum *filter_res = nullptr;
+        filter_expr->clear_evaluated_flag(*eval_ctx);
+        if (OB_FAIL(filter_expr->eval(*eval_ctx, filter_res))) {
+        } else {
+          need_project = !(filter_res->is_null() || 0 == filter_res->get_int());
+        }
       }
     }
   } else if (OB_UNLIKELY(0 != count)) {
@@ -415,7 +447,25 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
   ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
   ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
 
-  if (eval_ctx->is_vectorized()) {
+  if (eval_ctx->is_vectorized() && id_proj_expr->is_batch_result()
+      && (!iter_param_->need_project_relevance() || relevance_proj_expr->is_batch_result())) {
+    // Resolve the output frames once. Setting each datum's batch index and
+    // expression flags separately is unnecessary for actual batch results.
+    ObDatum *id_datums = id_proj_expr->locate_datums_for_update(*eval_ctx, count);
+    for (int64_t i = 0; i < count; ++i) {
+      set_datum_func_(id_datums[i], buffered_domain_ids_[i]);
+    }
+    id_proj_expr->get_evaluated_flags(*eval_ctx).set_all(int64_t{0}, count);
+    id_proj_expr->set_evaluated_projected(*eval_ctx);
+    if (iter_param_->need_project_relevance()) {
+      ObDatum *score_datums = relevance_proj_expr->locate_datums_for_update(*eval_ctx, count);
+      for (int64_t i = 0; i < count; ++i) {
+        score_datums[i].set_double(buffered_relevances_[i]);
+      }
+      relevance_proj_expr->get_evaluated_flags(*eval_ctx).set_all(int64_t{0}, count);
+      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+    }
+  } else if (eval_ctx->is_vectorized()) {
     sql::ObBitVector &id_evaluated_flags = id_proj_expr->get_evaluated_flags(*eval_ctx);
     for (int64_t i = 0; i < count; ++i) {
       guard.set_batch_idx(i);
@@ -444,6 +494,16 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
     ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
     relevance_proj_datum.set_double(buffered_relevances_[0]);
     relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+  }
+  if (OB_SUCC(ret) && can_batch_score_filter(*iter_param_)) {
+    ObExpr *filter = iter_param_->filter_expr_;
+    ObDatum *filter_datums = filter->locate_datums_for_update(*eval_ctx, count);
+    for (int64_t i = 0; i < count; ++i) {
+      filter_datums[i].set_int32(1);
+    }
+    filter->get_evaluated_flags(*eval_ctx).set_all(int64_t{0}, count);
+    // Match set_evaluated_flag: do not change the expression's projected bit.
+    filter->get_eval_info(*eval_ctx).evaluated_ = true;
   }
   return ret;
 }

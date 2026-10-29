@@ -377,13 +377,26 @@ static int ob_strnncollsp_utf8mb4(const ObCharsetInfo *cs,
                        const unsigned char *dst, size_t dstlen,
                        bool diff_if_only_endspace_difference)
 {
+  // Identical bytes compare equal under either trailing-space policy. This
+  // avoids decoding the same repeated sort key twice; different byte strings
+  // still require the collation weights (including case/accent equivalence).
+  if (srclen == dstlen && (srclen == 0 || src == dst || memcmp(src, dst, srclen) == 0)) {
+    return 0;
+  }
   int res;
   ob_wc_t src_wc = 0, dst_wc = 0;
   const unsigned char *se= src + srclen, *te= dst + dstlen;
   ObUnicaseInfo *uni_plane= cs->caseinfo;
   while ( src < se && dst < te ) {
-    int s_res= ob_mb_wc_utf8mb4(cs, &src_wc, src, se);
-    int t_res= ob_mb_wc_utf8mb4(cs, &dst_wc, dst, te);
+    int s_res = 1, t_res = 1;
+    // ASCII bytes are complete UTF-8 characters. Keep the same weight folding
+    // below, but avoid two decoder calls for this common pair of characters.
+    src_wc = *src;
+    dst_wc = *dst;
+    if (src_wc >= 0x80 || dst_wc >= 0x80) {
+      s_res = ob_mb_wc_utf8mb4(cs, &src_wc, src, se);
+      t_res = ob_mb_wc_utf8mb4(cs, &dst_wc, dst, te);
+    }
     if ( s_res <= 0 || t_res <= 0 ) {
       return bincmp_utf8mb4(src, se, dst, te);
     }

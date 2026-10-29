@@ -125,7 +125,21 @@ int ObGenDicLoader::get_dic_loader(const ObString &parser_name,
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(dic_loader_key.init(parser_name, charset))) {
   } else {
+    // The registry never replaces a published loader pointer. Acquire the
+    // handle under a read lock; only a missing key needs exclusive publication.
+    {
+      TCRLockGuard guard(lock_);
+      if (OB_FAIL(guard.get_ret())) {
+        return ret;
+      } else if (OB_SUCC(ret = dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
+        return loader_handle.set_loader(dic_loader);
+      }
+    }
+    if (OB_HASH_NOT_EXIST != ret) {
+      return OB_ERR_UNEXPECTED;
+    }
     TCWLockGuard guard(lock_);
+    // Another caller may have inserted this key while the lock was released.
     if (OB_FAIL(dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
       if (OB_HASH_NOT_EXIST == ret) {
         if (OB_FAIL(gen_dic_loader(dic_loader_key, dic_loader))) {
