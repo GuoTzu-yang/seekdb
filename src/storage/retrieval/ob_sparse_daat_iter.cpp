@@ -393,11 +393,17 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
     }
     return ret;
   }
+  if (!iter_param_->need_filter()) {
+    // No filter means every candidate is projected unchanged, so the batch scope
+    // guard below has nothing to restore. Returning before constructing it keeps
+    // count-only scans off that save/restore path entirely.
+    need_project = true;
+    return ret;
+  }
+
   ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
 
-  if (!iter_param_->need_filter()) {
-    need_project = true;
-  } else if (eval_ctx->is_vectorized()) {
+  if (eval_ctx->is_vectorized()) {
     if (OB_UNLIKELY(count >= eval_ctx->max_batch_size_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
