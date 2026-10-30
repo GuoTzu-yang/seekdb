@@ -364,6 +364,80 @@ int resolve_parser_cached(const common::ObString &name,
 }
 } // namespace
 
+namespace {
+// The parser properties handed to the helper are the normalised JSON text
+// produced for this statement, so parsing them again on every evaluation only
+// repeats work whose result cannot change.  Cache the parsed properties per
+// thread; the resolved parser descriptor is part of the key, so a different
+// parser type or version never reuses another entry.
+struct ObFTPropertyCacheSlot
+{
+  static const int64_t MAX_BYTES = 1024;
+  char name_[MAX_BYTES];
+  char props_[MAX_BYTES];
+  int64_t name_len_;
+  int64_t props_len_;
+  const ObIFTParserDesc *desc_;
+  bool valid_;
+  ObFTParserProperty prop_;
+  ObFTPropertyCacheSlot()
+    : name_len_(-1), props_len_(-1), desc_(nullptr), valid_(false) {}
+};
+
+struct ObFTPropertyCache
+{
+  static const int64_t SLOT_CNT = 4;
+  ObFTPropertyCacheSlot slots_[SLOT_CNT];
+  int64_t next_;
+  ObFTPropertyCache() : next_(0) {}
+};
+
+int parse_property_cached(const ObFTParser &parser,
+                           const ObString &raw_name,
+                           const ObString &json_str,
+                           const ObIFTParserDesc *desc,
+                           ObFTParserProperty &result)
+{
+  int ret = OB_SUCCESS;
+  static thread_local ObFTPropertyCache cache;
+  const int64_t name_len = raw_name.length();
+  const int64_t props_len = json_str.length();
+  const bool cacheable = name_len >= 0 && name_len < ObFTPropertyCacheSlot::MAX_BYTES
+                         && props_len >= 0 && props_len < ObFTPropertyCacheSlot::MAX_BYTES;
+  ObFTPropertyCacheSlot *hit = nullptr;
+
+  if (cacheable) {
+    for (int64_t i = 0; OB_ISNULL(hit) && i < ObFTPropertyCache::SLOT_CNT; ++i) {
+      ObFTPropertyCacheSlot &slot = cache.slots_[i];
+      if (slot.valid_ && slot.desc_ == desc
+          && slot.name_len_ == name_len && slot.props_len_ == props_len
+          && 0 == MEMCMP(slot.name_, raw_name.ptr(), name_len)
+          && 0 == MEMCMP(slot.props_, json_str.ptr(), props_len)) {
+        hit = &slot;
+      }
+    }
+  }
+
+  if (nullptr != hit) {
+    result = hit->prop_;
+  } else {
+    if (OB_FAIL(result.parse_for_parser_helper(parser, json_str))) {
+    } else if (cacheable) {
+      ObFTPropertyCacheSlot &slot = cache.slots_[cache.next_];
+      cache.next_ = (cache.next_ + 1) % ObFTPropertyCache::SLOT_CNT;
+      MEMCPY(slot.name_, raw_name.ptr(), name_len);
+      MEMCPY(slot.props_, json_str.ptr(), props_len);
+      slot.name_len_ = name_len;
+      slot.props_len_ = props_len;
+      slot.desc_ = desc;
+      slot.prop_ = result;
+      slot.valid_ = true;
+    }
+  }
+  return ret;
+}
+} // namespace
+
 int ObFTParseHelper::init(
     common::ObIAllocator *allocator,
     const common::ObString &parser_name,
@@ -375,7 +449,7 @@ int ObFTParseHelper::init(
   } else if (OB_ISNULL(allocator) || OB_UNLIKELY(parser_name.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(resolve_parser_cached(parser_name, parser_name_, parser_desc_))) {
-  } else if (OB_FAIL(parser_property_.parse_for_parser_helper(parser_name_, parser_properties))) {
+  } else if (OB_FAIL(parse_property_cached(parser_name_, parser_name, parser_properties, parser_desc_, parser_property_))) {
   } else if (OB_ISNULL(parser_desc_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(set_add_word_flag(*parser_desc_))) {
