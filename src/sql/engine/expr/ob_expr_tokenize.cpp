@@ -430,19 +430,73 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   return ret;
 }
 
+namespace {
+// The inner parser name is a pure function of the parser name the user wrote,
+// but producing it walks the parser table with string compares and then
+// serialises the result, on every single TOKENIZE evaluation.  Cache the
+// mapping in fixed per-thread storage; the cached bytes live as long as the
+// thread and the expression keeps using the name only inside one evaluation.
+struct ObTokenizeParserNameSlot
+{
+  static const int64_t MAX_BYTES = 256;
+  char key_[MAX_BYTES];
+  char val_[MAX_BYTES];
+  int64_t key_len_;
+  int32_t val_len_;
+  ObTokenizeParserNameSlot() : key_len_(-1), val_len_(0) { MEMSET(key_, 0, sizeof(key_)); }
+};
+
+struct ObTokenizeParserNameCache
+{
+  static const int64_t SLOT_CNT = 4;
+  ObTokenizeParserNameSlot slots_[SLOT_CNT];
+  int64_t next_;
+  ObTokenizeParserNameCache() : next_(0) {}
+};
+} // namespace
+
 int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParser parser;
+  static thread_local ObTokenizeParserNameCache name_cache;
+  const int64_t in_len = input_str.length();
+  const bool cacheable = in_len > 0 && in_len <= ObTokenizeParserNameSlot::MAX_BYTES;
+  ObTokenizeParserNameSlot *hit = nullptr;
 
-  char *parser_name_buf = nullptr;
-  if (OB_ISNULL(parser_name_buf
-                = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(parser.init(input_str))) {
-  } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
+  if (cacheable) {
+    for (int64_t i = 0; OB_ISNULL(hit) && i < ObTokenizeParserNameCache::SLOT_CNT; ++i) {
+      ObTokenizeParserNameSlot &slot = name_cache.slots_[i];
+      if (slot.key_len_ == in_len && 0 == MEMCMP(slot.key_, input_str.ptr(), in_len)) {
+        hit = &slot;
+      }
+    }
+  }
+
+  if (nullptr != hit) {
+    param.parser_name_ = ObString::make_string(hit->val_);
   } else {
-    param.parser_name_ = ObString::make_string(parser_name_buf);
+    storage::ObFTParser parser;
+    char *parser_name_buf = nullptr;
+    if (OB_ISNULL(parser_name_buf
+                  = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(parser.init(input_str))) {
+    } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
+    } else {
+      param.parser_name_ = ObString::make_string(parser_name_buf);
+      if (cacheable) {
+        ObTokenizeParserNameSlot &slot = name_cache.slots_[name_cache.next_];
+        name_cache.next_ = (name_cache.next_ + 1) % ObTokenizeParserNameCache::SLOT_CNT;
+        MEMCPY(slot.key_, input_str.ptr(), in_len);
+        const int64_t name_len = param.parser_name_.length();
+        if (name_len + 1 <= ObTokenizeParserNameSlot::MAX_BYTES) {
+          MEMCPY(slot.val_, param.parser_name_.ptr(), name_len);
+          slot.val_[name_len] = '\0';
+          slot.key_len_ = in_len;
+          slot.val_len_ = static_cast<int32_t>(name_len);
+        }
+      }
+    }
   }
   return ret;
 }
