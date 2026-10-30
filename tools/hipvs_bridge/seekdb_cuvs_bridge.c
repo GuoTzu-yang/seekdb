@@ -10,13 +10,31 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
   cuvsResources_t        res;
   cuvsCagraIndexParams_t ip;
   cuvsCagraIndex_t       idx;
   long n, dim;
+  /* Reused per-index scratch: seekdb issues one vector per search, so
+   * re-allocating the device buffers and the search params every call costs
+   * more than the search itself at these query counts. */
+  cuvsCagraSearchParams_t sp;
+  float*    qd;  size_t qd_cap;   /* floats   */
+  unsigned* nd;  size_t nd_cap;   /* elements */
+  float*    dd;  size_t dd_cap;   /* floats   */
 } sk_cuvs_index;
+
+static int sk_reserve(cuvsResources_t res, void** p, size_t* cap, size_t need, size_t elem)
+{
+  if (*cap >= need) { return 0; }
+  if (*p != NULL) { cuvsRMMFree(res, *p, *cap * elem); *p = NULL; *cap = 0; }
+  void* q = NULL;
+  if (cuvsRMMAlloc(res, &q, need * elem) != CUVS_SUCCESS) { return 1; }
+  *p = q; *cap = need;
+  return 0;
+}
 
 void* seekdb_cuvs_build(const float* base, long n, long dim)
 {
@@ -33,9 +51,11 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 256;
-  h->ip->nn_descent_niter = 100;
+  // Retain more graph neighbors and search a wider beam so fewer NN-descent
+  // passes are needed. Keep the same policy for all vector dimensions.
+  h->ip->graph_degree = 160;
+  h->ip->intermediate_graph_degree = 160;
+  h->ip->nn_descent_niter = 16;
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;
@@ -54,10 +74,12 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h) return 1;
   int rc = 0;
-  float* qd = 0; unsigned* nd = 0; float* dd = 0; cuvsCagraSearchParams_t sp = 0;
-  if (cuvsRMMAlloc(h->res, (void**)&qd, sizeof(float)*nq*h->dim)  != CUVS_SUCCESS) { rc=10; goto done; }
-  if (cuvsRMMAlloc(h->res, (void**)&nd, sizeof(unsigned)*nq*topk) != CUVS_SUCCESS) { rc=11; goto done; }
-  if (cuvsRMMAlloc(h->res, (void**)&dd, sizeof(float)*nq*topk)    != CUVS_SUCCESS) { rc=12; goto done; }
+  if (sk_reserve(h->res, (void**)&h->qd, &h->qd_cap, (size_t)nq*h->dim, sizeof(float)) ||
+      sk_reserve(h->res, (void**)&h->nd, &h->nd_cap, (size_t)nq*topk, sizeof(unsigned)) ||
+      sk_reserve(h->res, (void**)&h->dd, &h->dd_cap, (size_t)nq*topk, sizeof(float))) {
+    rc = 10; goto done;
+  }
+  float* qd = h->qd; unsigned* nd = h->nd; float* dd = h->dd;
   if (cudaMemcpy(qd, query, sizeof(float)*nq*h->dim, cudaMemcpyDefault) != cudaSuccess) { rc=13; goto done; }
   {
     DLManagedTensor qt, nt, dt; long qs[2]={nq,h->dim}, nsh[2]={nq,topk}, dsh[2]={nq,topk};
@@ -66,24 +88,44 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
     qt.dl_tensor.shape=qs; qt.dl_tensor.strides=0; qt.dl_tensor.byte_offset=0;
     nt=qt; nt.dl_tensor.data=nd; nt.dl_tensor.dtype.code=kDLUInt; nt.dl_tensor.shape=nsh;
     dt=qt; dt.dl_tensor.data=dd; dt.dl_tensor.dtype.code=kDLFloat; dt.dl_tensor.shape=dsh;
-    if (cuvsCagraSearchParamsCreate(&sp) != CUVS_SUCCESS) { rc=14; goto done; }
+    if (h->sp == NULL && cuvsCagraSearchParamsCreate(&h->sp) != CUVS_SUCCESS) { rc=14; goto done; }
     {
       size_t required_itopk = (size_t)topk * 4;
       if (required_itopk < 512) required_itopk = 512;
-      if (sp->itopk_size < required_itopk) sp->itopk_size = required_itopk;
-      sp->search_width = 4;
+      if (h->sp->itopk_size < required_itopk) h->sp->itopk_size = required_itopk;
+      // Width 16 fits the tested gfx1100 search path with a 160-degree graph.
+      h->sp->search_width = 16;
     }
     cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
-    if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc=15; goto done; }
+    if (cuvsCagraSearch(h->res, h->sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc=15; goto done; }
     if (cudaMemcpy(out_ids, nd, sizeof(unsigned)*nq*topk, cudaMemcpyDefault) != cudaSuccess) { rc=16; goto done; }
     if (out_dist) cudaMemcpy(out_dist, dd, sizeof(float)*nq*topk, cudaMemcpyDefault);
   }
 done:
-  if (sp) cuvsCagraSearchParamsDestroy(sp);
-  if (dd) cuvsRMMFree(h->res, dd, sizeof(float)*nq*topk);
-  if (nd) cuvsRMMFree(h->res, nd, sizeof(unsigned)*nq*topk);
-  if (qd) cuvsRMMFree(h->res, qd, sizeof(float)*nq*h->dim);
   if (rc) fprintf(stderr, "[seekdb_cuvs] search rc=%d: %s\n", rc, cuvsGetLastErrorText());
+  return rc;
+}
+
+int seekdb_cuvs_copy_dataset(void* handle, float* out, long n, long dim)
+{
+  sk_cuvs_index* h = (sk_cuvs_index*)handle;
+  if (!h || !out || n <= 0 || dim <= 0) return 1;
+  DLManagedTensor ds;
+  memset(&ds, 0, sizeof(ds));
+  if (cuvsCagraIndexGetDataset(h->idx, &ds) != CUVS_SUCCESS) {
+    fprintf(stderr, "[seekdb_cuvs] copy_dataset: get failed: %s\n", cuvsGetLastErrorText());
+    return 2;
+  }
+  int rc = 0;
+  if (ds.dl_tensor.ndim != 2 || ds.dl_tensor.shape == NULL ||
+      ds.dl_tensor.shape[0] != (int64_t)n || ds.dl_tensor.shape[1] != (int64_t)dim) {
+    rc = 3;
+  } else if (cudaMemcpy(out, ds.dl_tensor.data, sizeof(float) * (size_t)n * (size_t)dim,
+                        cudaMemcpyDefault) != cudaSuccess) {
+    rc = 4;
+  }
+  if (ds.deleter != NULL) { ds.deleter(&ds); }
+  if (rc != 0) { fprintf(stderr, "[seekdb_cuvs] copy_dataset failed rc=%d\n", rc); }
   return rc;
 }
 
@@ -91,6 +133,10 @@ void seekdb_cuvs_free(void* handle)
 {
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h) return;
+  if (h->sp) cuvsCagraSearchParamsDestroy(h->sp);
+  if (h->qd) cuvsRMMFree(h->res, h->qd, h->qd_cap * sizeof(float));
+  if (h->nd) cuvsRMMFree(h->res, h->nd, h->nd_cap * sizeof(unsigned));
+  if (h->dd) cuvsRMMFree(h->res, h->dd, h->dd_cap * sizeof(float));
   cuvsCagraIndexDestroy(h->idx);
   cuvsCagraIndexParamsDestroy(h->ip);
   cuvsResourcesDestroy(h->res);
