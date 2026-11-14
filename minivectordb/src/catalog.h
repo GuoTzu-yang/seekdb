@@ -122,6 +122,10 @@ struct UndoRec {
   // DROP TABLE 时把整张表（结构 + 数据 + 向量）搬到这里，
   // 否则 ROLLBACK 只能恢复一个空壳（曾经的 bug：连列定义都没有）
   std::unique_ptr<Table> dropped_table;
+  // 事务内 CREATE VECTOR INDEX 的逆操作：非空表示「这轮 undo 新建了这个索引」，
+  // ROLLBACK 时必须把它从 vindex_names 摘掉。否则 ROLLBACK 后索引仍在而数据
+  // 已回滚，状态不一致，后续同名建索引会报 already exists。
+  std::string created_vindex;
 };
 
 class Database {

@@ -136,6 +136,21 @@ Table* Database::find_ci(const std::string& name) {
 void Database::rollback_undo() {
   for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
     UndoRec& u = *it;
+    // 事务内新建的向量索引：摘掉它（与 Executor::undo_to 保持一致）
+    if (!u.created_vindex.empty()) {
+      auto fit = tables.find(u.table);
+      if (fit != tables.end() && fit->second) {
+        auto& names = fit->second->vindex_names;
+        for (size_t i = 0; i < names.size(); ++i) {
+          if (names[i] == u.created_vindex) {
+            names.erase(names.begin() + (long)i);
+            break;
+          }
+        }
+        fit->second->has_vindex = !names.empty();
+      }
+      continue;
+    }
     if (u.is_table_level) {
       if (u.dropped_whole_table) {
         if (u.dropped_table) {

@@ -246,6 +246,23 @@ void Executor::record_undo_row(Table* t, int64_t pk, bool existed, const Row& ol
 void Executor::undo_to(size_t mark) {
   while (db_.undo.size() > mark) {
     UndoRec& u = db_.undo.back();
+    // 事务内新建的向量索引：把它从索引名表里摘掉。
+    // 不处理的话 ROLLBACK 之后索引仍然存在，与已回滚的数据不一致。
+    if (!u.created_vindex.empty()) {
+      Table* vt = db_.find_ci(u.table);
+      if (vt) {
+        auto& names = vt->vindex_names;
+        for (size_t i = 0; i < names.size(); ++i) {
+          if (names[i] == u.created_vindex) {
+            names.erase(names.begin() + (long)i);
+            break;
+          }
+        }
+        vt->has_vindex = !names.empty();
+      }
+      db_.undo.pop_back();
+      continue;
+    }
     Table* t = db_.find_ci(u.table);
     if (t) {
       auto pit = t->pkidx.find(u.pk);
@@ -367,6 +384,18 @@ Result Executor::do_create_table(const Stmt& st, const std::string& sql) {
   t->name = st.table;
   int pk_count = 0;
   int vec_count = 0;
+  // 列名重复必须报错：留着会让 col_index 只命中第一个，后续读写落到错误的列上，
+  // 正是题面 2.1 禁止的「静默执行为其他含义」。
+  for (size_t i = 0; i < st.cols.size(); ++i) {
+    for (size_t j = i + 1; j < st.cols.size(); ++j) {
+      if (ieq(st.cols[i].name.c_str(), st.cols[j].name.c_str())) {
+        r.code = E_DUP_KEY;
+        r.err_name = "duplicate_key";
+        r.err_msg = "duplicate column name: " + st.cols[i].name;
+        return r;
+      }
+    }
+  }
   for (auto& c : st.cols) {
     if (c.type == ColType::INT) {
       if (c.is_pk) ++pk_count;
@@ -415,12 +444,20 @@ Result Executor::do_create_table(const Stmt& st, const std::string& sql) {
 
 Result Executor::do_drop_table(const Stmt& st, const std::string& sql) {
   Result r;
+  // 赛题 2.1 的表结构支持范围只有 CREATE TABLE，且 2.3 明确「每个正式用例
+  // 从独立的数据目录开始」，因此用例不需要用 DROP 做清理。
+  // 按「不支持的语句须返回约定错误，不能静默执行为其他含义」，裸 DROP TABLE
+  // 一律拒绝；只保留 DROP TABLE IF EXISTS 作为幂等清理（不存在的表是空操作）。
+  if (!st.if_exists) {
+    r.code = E_NOT_SUPPORTED;
+    r.err_msg = "DROP TABLE is outside the supported SQL subset";
+    return r;
+  }
   Table* t = db_.find_ci(st.table);
   if (!t) {
-    // DROP TABLE IF EXISTS 一个不存在的表：按 MySQL 语义是成功的空操作。
-    // 驱动/题包常用它做幂等清理，报错会让整个用例失败。
-    if (st.if_exists) { r.info = "DROP TABLE IF EXISTS (noop)"; return r; }
-    r.code = E_NO_TABLE; r.err_msg = "table does not exist"; return r;
+    // DROP TABLE IF EXISTS 一个不存在的表：幂等空操作，报错会让清理步骤失败。
+    r.info = "DROP TABLE IF EXISTS (noop)";
+    return r;
   }
   std::string real = t->name;
   if (db_.in_txn) {
@@ -447,7 +484,7 @@ Result Executor::do_insert(const Stmt& st, const std::string& sql) {
   size_t mark = undo_mark();
   int64_t inserted = 0;
 
-  // 列清单 → 表列下标；缺列填默认值（0 / 空串 / 零向量）
+  // 列清单 → 表列下标
   std::vector<int> map;
   const bool partial = !st.insert_cols.empty();
   if (partial) {
@@ -459,6 +496,25 @@ Result Executor::do_insert(const Stmt& st, const std::string& sql) {
         return r;
       }
       map.push_back(ci);
+    }
+    // 指定列名的 INSERT 必须覆盖全部列。缺列意味着要填默认值或 NULL，
+    // 而赛题不支持 NULL 也从未定义默认值；静默填 0/空串/零向量等于
+    // 「把它执行为其他含义」，必须报错（同名重复列同理）。
+    {
+      std::vector<int> seen = map;
+      std::sort(seen.begin(), seen.end());
+      if (std::adjacent_find(seen.begin(), seen.end()) != seen.end()) {
+        undo_to(mark);
+        r.code = E_NOT_SUPPORTED;
+        r.err_msg = "duplicate column in INSERT list";
+        return r;
+      }
+      if (map.size() != t->cols.size()) {
+        undo_to(mark);
+        r.code = E_NOT_SUPPORTED;
+        r.err_msg = "INSERT column list must cover all columns";
+        return r;
+      }
     }
   }
 
@@ -673,6 +729,16 @@ Result Executor::do_create_vindex(const Stmt& st, const std::string& sql) {
   }
   t->vindex_names.push_back(lname);
   t->has_vindex = true;   // 第一版：标记即可，精确检索始终可用
+  // 事务内建的索引必须能回滚：记录一条 undo，ROLLBACK 时把它摘掉。
+  // 否则 ROLLBACK 后索引还在而数据已回滚，状态不一致。
+  if (db_.in_txn) {
+    UndoRec u;
+    u.table = t->name;
+    u.is_table_level = true;      // 不参与行级 undo
+    u.dropped_whole_table = false;
+    u.created_vindex = lname;
+    db_.undo.push_back(std::move(u));
+  }
   persist(sql);
   r.info = "CREATE VECTOR INDEX";
   return r;
@@ -828,12 +894,38 @@ Result Executor::do_select(const Stmt& st) {
     x.or_prev = c.or_prev;
     x.ci = t->col_index(c.col);
     if (x.ci < 0) { r.code = E_NO_COL; r.err_msg = "unknown column in WHERE: " + c.col; return r; }
+    // 向量列不能参与标量比较（赛题 2.1 只定义了普通列的比较）。
+    // 静默返回空结果等于把它「执行为其他含义」，必须报错。
+    if (t->cols[x.ci].type == ColType::VECTOR) {
+      r.code = E_NOT_SUPPORTED;
+      r.err_msg = "comparison on a vector column is not supported: " + c.col;
+      return r;
+    }
     if (c.rhs_is_col) {
       x.rhs_ci = t->col_index(c.rhs_col);
       if (x.rhs_ci < 0) { r.code = E_NO_COL; r.err_msg = "unknown column in WHERE: " + c.rhs_col; return r; }
+      if (t->cols[x.rhs_ci].type == ColType::VECTOR) {
+        r.code = E_NOT_SUPPORTED;
+        r.err_msg = "comparison on a vector column is not supported: " + c.rhs_col;
+        return r;
+      }
     } else {
       x.rhs_ci = -1;
       x.val = c.val;
+      // 字面量类型必须与列类型相容。不相容时静默比较（永远不相等）等于把它
+      // 「执行为其他含义」，按赛题 2.1 必须报错。
+      // 浮点截断已在解析层（parse_scalar）拒绝，这里只处理跨类型错配。
+      const ColType ct = t->cols[x.ci].type;
+      if (ct == ColType::INT && x.val.type == ColType::VARCHAR) {
+        r.code = E_INVALID_VALUE;
+        r.err_msg = "type mismatch in WHERE: " + c.col + " is BIGINT but compared to a string";
+        return r;
+      }
+      if (ct == ColType::VARCHAR && x.val.type != ColType::VARCHAR) {
+        r.code = E_INVALID_VALUE;
+        r.err_msg = "type mismatch in WHERE: " + c.col + " is VARCHAR but compared to a number";
+        return r;
+      }
     }
     wc.push_back(std::move(x));
   }

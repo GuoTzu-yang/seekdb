@@ -28,11 +28,24 @@ struct P {
   }
 
   std::string ident() {
-    if (cur().kind == Tok::IDENT) { std::string s = cur().text; adv(); return s; }
+    std::string s;
+    if (cur().kind == Tok::IDENT) { s = cur().text; adv(); }
     // 允许关键字作标识符
-    if (cur().kind == Tok::INT_LIT) { std::string s = cur().text; adv(); return s; }
-    err = "expected identifier";
-    return {};
+    else if (cur().kind == Tok::INT_LIT) { s = cur().text; adv(); }
+    else { err = "expected identifier"; return {}; }
+    // 限定名 a.b / a.b.c：本题只有单表，取最后一段即可。
+    // mysqltest 风格的用例常写 t.id，不认它就是整条用例 syntax_error。
+    while (cur().kind == Tok::PUNCT && cur().text == ".") {
+      adv();
+      if (cur().kind == Tok::IDENT || cur().kind == Tok::INT_LIT) {
+        s = cur().text;
+        adv();
+      } else {
+        err = "expected identifier after '.'";
+        return {};
+      }
+    }
+    return s;
   }
 
   // 解析一个标量值（整数 / 字符串 / 浮点原文）。支持前置一元 +/-。
@@ -81,8 +94,17 @@ struct P {
       char* endp = nullptr;
       double d = std::strtod(s.c_str(), &endp);
       if (endp && *endp == '\0' && endp != s.c_str()) {
+        // 浮点原文只接受「精确整数」：1.0 / 1e3 合法，1.5 必须报错。
+        // 旧代码直接 (int64_t)d 静默截断，`WHERE id = 1.5` 会匹配到 id=1，
+        // 正是题面 2.1 禁止的「静默执行为其他含义」。
+        const double dv = neg ? -d : d;
+        if (!(dv >= -9223372036854775808.0 && dv < 9223372036854775808.0) ||
+            dv != (double)(int64_t)dv) {
+          err = "non-integer numeric literal where an integer is required: " + s;
+          return false;
+        }
         out.type = ColType::INT;
-        out.i = neg ? (int64_t)(-d) : (int64_t)d;
+        out.i = (int64_t)dv;
         adv();
         return true;
       }

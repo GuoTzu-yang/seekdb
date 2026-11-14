@@ -49,7 +49,12 @@ class VecStore {
       base_ = (float*)p;
     }
     ::close(fd);
-    size_ = map_floats_;
+    // size_ 是「有效数据长度」，不是「文件容量」。
+    // 早先这里写 size_ = map_floats_，重启后 append 会从文件容量处开始写：
+    // 于是 need = 容量 + 1 触发一次无谓扩容（.vec 直接翻倍），新向量落在
+    // 有效数据之后的空洞里，读回来是 [0,0] —— 表现为「行在、向量全零」。
+    // 有效长度一律由 load_snapshot / WAL 重放 / resize_vecs 显式设定。
+    size_ = 0;
     return true;
   }
 
@@ -64,6 +69,11 @@ class VecStore {
     int fd = ::open(path_.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd < 0) { err = "cannot reopen vec file: " + path_; return false; }
     if (::ftruncate(fd, (off_t)cap_bytes) != 0) { ::close(fd); err = "ftruncate vec file failed"; return false; }
+    // ftruncate 改的是文件长度（元数据）。进程被 SIGKILL 时这条元数据可能还停在
+    // 内核里没落盘，重启后文件仍是旧长度 —— 新写入的向量就落在 EOF 之外读不到，
+    // 表现为「行在、向量全是 0」。扩容是翻倍式的、次数很少，这里 fsync 一次把
+    // 长度钉住；数据本身仍靠页缓存（进程被 kill 不影响页缓存）。
+    ::fsync(fd);
     if (base_) { ::munmap(base_, map_floats_ * sizeof(float)); base_ = nullptr; }
     void* p = ::mmap(nullptr, cap_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     ::close(fd);
